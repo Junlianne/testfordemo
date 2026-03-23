@@ -1,6 +1,7 @@
 import requests
 import os
 from abc import ABC, abstractmethod
+from .utils import retry
 
 class GitProvider(ABC):
     @abstractmethod
@@ -19,13 +20,14 @@ class GitHubProvider(GitProvider):
         if self.token:
             self.headers["Authorization"] = f"token {self.token}"
 
+    @retry(exceptions=(requests.RequestException, Exception), tries=3, delay=1, backoff=2)
     def get_pr_details(self, pr_info):
         owner = pr_info["owner"]
         repo = pr_info["repo"]
         pr_id = pr_info["pr_id"]
         
         url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_id}"
-        response = requests.get(url, headers=self.headers)
+        response = requests.get(url, headers=self.headers, timeout=10)
         
         if response.status_code == 200:
             data = response.json()
@@ -39,6 +41,7 @@ class GitHubProvider(GitProvider):
         else:
             raise Exception(f"GitHub API Error: {response.status_code} - {response.text}")
 
+    @retry(exceptions=(requests.RequestException, Exception), tries=3, delay=1, backoff=2)
     def get_diff(self, pr_info):
         owner = pr_info["owner"]
         repo = pr_info["repo"]
@@ -49,7 +52,7 @@ class GitHubProvider(GitProvider):
         headers["Accept"] = "application/vnd.github.v3.diff"
         
         url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_id}"
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=10)
         
         if response.status_code == 200:
             return response.text
@@ -64,13 +67,17 @@ class GitLabProvider(GitProvider):
         if self.token:
             self.headers["Private-Token"] = self.token
 
+    @retry(exceptions=(requests.RequestException, Exception), tries=3, delay=1, backoff=2)
     def get_pr_details(self, pr_info):
         # GitLab uses URL-encoded path as ID
         project_path = pr_info["repo_path"].replace("/", "%2F")
         mr_id = pr_info["pr_id"]
         
-        url = f"{self.base_url}/projects/{project_path}/merge_requests/{mr_id}"
-        response = requests.get(url, headers=self.headers)
+        # Override base_url if provided in parsed info
+        base_url = pr_info.get("base_url", self.base_url)
+        
+        url = f"{base_url}/projects/{project_path}/merge_requests/{mr_id}"
+        response = requests.get(url, headers=self.headers, timeout=10)
         
         if response.status_code == 200:
             data = response.json()
@@ -84,16 +91,16 @@ class GitLabProvider(GitProvider):
         else:
             raise Exception(f"GitLab API Error: {response.status_code} - {response.text}")
 
+    @retry(exceptions=(requests.RequestException, Exception), tries=3, delay=1, backoff=2)
     def get_diff(self, pr_info):
         project_path = pr_info["repo_path"].replace("/", "%2F")
         mr_id = pr_info["pr_id"]
         
-        # GitLab MR changes API gives structured diffs, but we want a raw diff for simplicity if possible.
-        # Or we can construct a text diff from the changes API.
-        # The .diff endpoint on the MR web URL is often available, but via API we use /changes
+        # Override base_url if provided in parsed info
+        base_url = pr_info.get("base_url", self.base_url)
         
-        url = f"{self.base_url}/projects/{project_path}/merge_requests/{mr_id}/changes"
-        response = requests.get(url, headers=self.headers)
+        url = f"{base_url}/projects/{project_path}/merge_requests/{mr_id}/changes"
+        response = requests.get(url, headers=self.headers, timeout=10)
         
         if response.status_code == 200:
             data = response.json()
@@ -105,3 +112,99 @@ class GitLabProvider(GitProvider):
             return diff_text
         else:
             raise Exception(f"GitLab API Error fetching diff: {response.status_code} - {response.text}")
+
+class GiteeProvider(GitProvider):
+    def __init__(self, token=None):
+        self.token = token
+        self.base_url = "https://gitee.com/api/v5"
+
+    @retry(exceptions=(requests.RequestException, Exception), tries=3, delay=1, backoff=2)
+    def get_pr_details(self, pr_info):
+        owner = pr_info["owner"]
+        repo = pr_info["repo"]
+        pr_id = pr_info["pr_id"]
+        
+        url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_id}"
+        params = {}
+        if self.token:
+            params["access_token"] = self.token
+            
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "title": data.get("title"),
+                "description": data.get("body"),
+                "author": data.get("user", {}).get("login"),
+                "state": data.get("state"),
+                "url": data.get("html_url")
+            }
+        else:
+            raise Exception(f"Gitee API Error: {response.status_code} - {response.text}")
+
+    @retry(exceptions=(requests.RequestException, Exception), tries=3, delay=1, backoff=2)
+    def get_diff(self, pr_info):
+        owner = pr_info["owner"]
+        repo = pr_info["repo"]
+        pr_id = pr_info["pr_id"]
+        
+        url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_id}/files"
+        params = {}
+        if self.token:
+            params["access_token"] = self.token
+            
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            files = response.json()
+            diff_text = ""
+            for file in files:
+                diff_text += f"--- {file.get('filename')}\n+++ {file.get('filename')}\n"
+                diff_text += file.get("patch", "") + "\n"
+            return diff_text
+        else:
+            raise Exception(f"Gitee API Error fetching diff: {response.status_code} - {response.text}")
+
+class BitbucketProvider(GitProvider):
+    def __init__(self, token=None):
+        self.token = token
+        self.base_url = "https://api.bitbucket.org/2.0"
+        self.headers = {"Accept": "application/json"}
+        if self.token:
+            self.headers["Authorization"] = f"Bearer {self.token}"
+
+    @retry(exceptions=(requests.RequestException, Exception), tries=3, delay=1, backoff=2)
+    def get_pr_details(self, pr_info):
+        owner = pr_info["owner"]
+        repo = pr_info["repo"]
+        pr_id = pr_info["pr_id"]
+        
+        url = f"{self.base_url}/repositories/{owner}/{repo}/pullrequests/{pr_id}"
+        response = requests.get(url, headers=self.headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "title": data.get("title"),
+                "description": data.get("description"),
+                "author": data.get("author", {}).get("display_name"),
+                "state": data.get("state"),
+                "url": data.get("links", {}).get("html", {}).get("href")
+            }
+        else:
+            raise Exception(f"Bitbucket API Error: {response.status_code} - {response.text}")
+
+    @retry(exceptions=(requests.RequestException, Exception), tries=3, delay=1, backoff=2)
+    def get_diff(self, pr_info):
+        owner = pr_info["owner"]
+        repo = pr_info["repo"]
+        pr_id = pr_info["pr_id"]
+        
+        url = f"{self.base_url}/repositories/{owner}/{repo}/pullrequests/{pr_id}/diff"
+        response = requests.get(url, headers=self.headers, timeout=10)
+        
+        if response.status_code == 200:
+            return response.text
+        else:
+            raise Exception(f"Bitbucket API Error fetching diff: {response.status_code} - {response.text}")
